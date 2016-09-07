@@ -2769,7 +2769,7 @@ Batch.prototype.execute = function () {
         }).forEach(function (result, index) {
             if (requests[index].callback) {
 
-                if (!Jsonrpc.getInstance().isValidResponse(result)) {
+                if (!Jsonrpc.isValidResponse(result)) {
                     return requests[index].callback(errors.InvalidResponse(result));
                 }
 
@@ -3573,11 +3573,15 @@ Filter.prototype.watch = function (callback) {
     return this;
 };
 
-Filter.prototype.stopWatching = function () {
+Filter.prototype.stopWatching = function (callback) {
     this.requestManager.stopPolling(this.filterId);
-    // remove filter async
-    this.implementation.uninstallFilter(this.filterId, function(){});
     this.callbacks = [];
+    // remove filter async
+    if (callback) {
+        this.implementation.uninstallFilter(this.filterId, callback);
+    } else {
+        return this.implementation.uninstallFilter(this.filterId);
+    }
 };
 
 Filter.prototype.get = function (callback) {
@@ -4766,25 +4770,13 @@ module.exports = IpcProvider;
 /** @file jsonrpc.js
  * @authors:
  *   Marek Kotewicz <marek@ethdev.com>
+ *   Aaron Kumavis <aaron@kumavis.me>
  * @date 2015
  */
 
-var Jsonrpc = function () {
-    // singleton pattern
-    if (arguments.callee._singletonInstance) {
-        return arguments.callee._singletonInstance;
-    }
-    arguments.callee._singletonInstance = this;
-
-    this.messageId = 1;
-};
-
-/**
- * @return {Jsonrpc} singleton
- */
-Jsonrpc.getInstance = function () {
-    var instance = new Jsonrpc();
-    return instance;
+// Initialize Jsonrpc as a simple object with utility functions.
+var Jsonrpc = {
+    messageId: 0
 };
 
 /**
@@ -4795,15 +4787,18 @@ Jsonrpc.getInstance = function () {
  * @param {Array} params, an array of method params, optional
  * @returns {Object} valid jsonrpc payload object
  */
-Jsonrpc.prototype.toPayload = function (method, params) {
+Jsonrpc.toPayload = function (method, params) {
     if (!method)
         console.error('jsonrpc method should be specified!');
 
+    // advance message ID
+    Jsonrpc.messageId++;
+
     return {
         jsonrpc: '2.0',
+        id: Jsonrpc.messageId,
         method: method,
-        params: params || [],
-        id: this.messageId++
+        params: params || []
     };
 };
 
@@ -4814,12 +4809,16 @@ Jsonrpc.prototype.toPayload = function (method, params) {
  * @param {Object}
  * @returns {Boolean} true if response is valid, otherwise false
  */
-Jsonrpc.prototype.isValidResponse = function (response) {
-    return !!response &&
-        !response.error &&
-        response.jsonrpc === '2.0' &&
-        typeof response.id === 'number' &&
-        response.result !== undefined; // only undefined is not valid json object
+Jsonrpc.isValidResponse = function (response) {
+    return Array.isArray(response) ? response.every(validateSingleMessage) : validateSingleMessage(response);
+
+    function validateSingleMessage(message){
+      return !!message &&
+        !message.error &&
+        message.jsonrpc === '2.0' &&
+        typeof message.id === 'number' &&
+        message.result !== undefined; // only undefined is not valid json object
+    }
 };
 
 /**
@@ -4829,10 +4828,9 @@ Jsonrpc.prototype.isValidResponse = function (response) {
  * @param {Array} messages, an array of objects with method (required) and params (optional) fields
  * @returns {Array} batch payload
  */
-Jsonrpc.prototype.toBatchPayload = function (messages) {
-    var self = this;
+Jsonrpc.toBatchPayload = function (messages) {
     return messages.map(function (message) {
-        return self.toPayload(message.method, message.params);
+        return Jsonrpc.toPayload(message.method, message.params);
     });
 };
 
@@ -5976,7 +5974,7 @@ module.exports = Property;
     You should have received a copy of the GNU Lesser General Public License
     along with web3.js.  If not, see <http://www.gnu.org/licenses/>.
 */
-/** 
+/**
  * @file requestmanager.js
  * @author Jeffrey Wilcke <jeff@ethdev.com>
  * @author Marek Kotewicz <marek@ethdev.com>
@@ -6016,10 +6014,10 @@ RequestManager.prototype.send = function (data) {
         return null;
     }
 
-    var payload = Jsonrpc.getInstance().toPayload(data.method, data.params);
+    var payload = Jsonrpc.toPayload(data.method, data.params);
     var result = this.provider.send(payload);
 
-    if (!Jsonrpc.getInstance().isValidResponse(result)) {
+    if (!Jsonrpc.isValidResponse(result)) {
         throw errors.InvalidResponse(result);
     }
 
@@ -6038,13 +6036,13 @@ RequestManager.prototype.sendAsync = function (data, callback) {
         return callback(errors.InvalidProvider());
     }
 
-    var payload = Jsonrpc.getInstance().toPayload(data.method, data.params);
+    var payload = Jsonrpc.toPayload(data.method, data.params);
     this.provider.sendAsync(payload, function (err, result) {
         if (err) {
             return callback(err);
         }
-        
-        if (!Jsonrpc.getInstance().isValidResponse(result)) {
+
+        if (!Jsonrpc.isValidResponse(result)) {
             return callback(errors.InvalidResponse(result));
         }
 
@@ -6064,7 +6062,7 @@ RequestManager.prototype.sendBatch = function (data, callback) {
         return callback(errors.InvalidProvider());
     }
 
-    var payload = Jsonrpc.getInstance().toBatchPayload(data);
+    var payload = Jsonrpc.toBatchPayload(data);
 
     this.provider.sendAsync(payload, function (err, results) {
         if (err) {
@@ -6076,7 +6074,7 @@ RequestManager.prototype.sendBatch = function (data, callback) {
         }
 
         callback(err, results);
-    }); 
+    });
 };
 
 /**
@@ -6179,8 +6177,8 @@ RequestManager.prototype.poll = function () {
         return;
     }
 
-    var payload = Jsonrpc.getInstance().toBatchPayload(pollsData);
-    
+    var payload = Jsonrpc.toBatchPayload(pollsData);
+
     // map the request id to they poll id
     var pollsIdMap = {};
     payload.forEach(function(load, index){
@@ -6191,10 +6189,18 @@ RequestManager.prototype.poll = function () {
     var self = this;
     this.provider.sendAsync(payload, function (error, results) {
 
-
-        // TODO: console log?
         if (error) {
-            return;
+          if (self.polls.length === 0) {
+            self.callback(error);
+          }
+
+          for (var key in self.polls) {
+              if (self.polls.hasOwnProperty(key)) {
+                  self.polls[key].callback(error);
+              }
+          }
+
+          return false;
         }
 
         if (!utils.isArray(results)) {
@@ -6210,9 +6216,9 @@ RequestManager.prototype.poll = function () {
             } else
                 return false;
         }).filter(function (result) {
-            return !!result; 
+            return !!result;
         }).filter(function (result) {
-            var valid = Jsonrpc.getInstance().isValidResponse(result);
+            var valid = Jsonrpc.isValidResponse(result);
             if (!valid) {
                 result.callback(errors.InvalidResponse(result));
             }
@@ -6224,7 +6230,6 @@ RequestManager.prototype.poll = function () {
 };
 
 module.exports = RequestManager;
-
 
 },{"../utils/config":18,"../utils/utils":20,"./errors":26,"./jsonrpc":35}],46:[function(require,module,exports){
 
@@ -8383,7 +8388,8 @@ module.exports = transfer;
 	                if (i % 4) {
 	                    var bits1 = map.indexOf(base64Str.charAt(i - 1)) << ((i % 4) * 2);
 	                    var bits2 = map.indexOf(base64Str.charAt(i)) >>> (6 - (i % 4) * 2);
-	                    words[nBytes >>> 2] |= (bits1 | bits2) << (24 - (nBytes % 4) * 8);
+	                    var bitsCombined = bits1 | bits2;
+	                    words[nBytes >>> 2] |= (bitsCombined) << (24 - (nBytes % 4) * 8);
 	                    nBytes++;
 	                }
 	            }
